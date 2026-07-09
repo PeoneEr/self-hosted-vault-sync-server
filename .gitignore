@@ -1,2 +1,6 @@
+obsidian-sync-server
 /self-hosted-vault-sync-server
 /data/
+/tmp/
+.superpowers/
+docs/superpowers/

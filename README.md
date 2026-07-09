@@ -109,7 +109,9 @@ All endpoints except the unauthenticated preflight (`OPTIONS`) require
   point `auth.existingSecret` at it (see comments in
   [`values.yaml`](deploy/helm/values.yaml)). Ingress is optional and off by
   default (`ingress.enabled: false`) — turn it on and adapt `className`/
-  `host`/TLS to your own cluster.
+  `host`/TLS to your own cluster. (This project's own author runs a
+  separate, environment-specific chart in `.helm/` against ArgoCD/Vault —
+  not published here, since it's wired to one specific cluster.)
 - **Plain Docker**: `docker run -v $(pwd)/data:/data -p 8080:8080 ghcr.io/peoneer/self-hosted-vault-sync-server:latest`
 
 ## License
