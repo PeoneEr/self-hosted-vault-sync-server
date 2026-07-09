@@ -1,0 +1,27 @@
+image:
+  repository: ghcr.io/peoneer/self-hosted-vault-sync-server
+  tag: "latest"
+
+# This chart does not create the auth-token secret for you. Create it
+# yourself before installing, then point auth.existingSecret at its name:
+#
+#   kubectl create secret generic vault-sync-auth \
+#     --from-literal=authToken=<bootstrap-token-from-first-run-logs>
+auth:
+  existingSecret: vault-sync-auth
+  existingSecretKey: authToken
+
+ingress:
+  enabled: false
+  className: nginx
+  host: "sync.example.com"
+  tls:
+    enabled: false
+    secretName: vault-sync-tls
+    # Only used if tls.enabled — e.g. letsencrypt-prod with cert-manager.
+    clusterIssuer: ""
+
+pvc:
+  size: 5Gi
+  # Leave empty to use your cluster's default StorageClass.
+  storageClass: ""

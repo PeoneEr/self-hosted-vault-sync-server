@@ -1,0 +1,6 @@
+apiVersion: v2
+name: self-hosted-vault-sync-server
+description: Generic Helm chart for self-hosted-vault-sync-server — adapt to your own cluster.
+type: application
+version: 0.1.0
+appVersion: "0.2.1"

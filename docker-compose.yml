@@ -1,0 +1,8 @@
+services:
+  vault-sync:
+    image: ghcr.io/peoneer/self-hosted-vault-sync-server:latest
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    ports:
+      - "8080:8080"
