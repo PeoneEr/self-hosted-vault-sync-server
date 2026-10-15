@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/audit"
 	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/changelog"
 	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/sse"
 	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/store"
@@ -28,20 +31,31 @@ type Handler struct {
 	sse       *sse.Broker
 	tokens    *tokens.Store
 	mux       *http.ServeMux
+
+	// audit is optional (nil disables journaling); see WithAudit.
+	audit      *audit.Log
+	trustProxy bool
+	admin      adminAuth
 }
 
 // New constructs a Handler and registers all routes.
 func New(s *store.Store, cl *changelog.Changelog, broker *sse.Broker, ts *tokens.Store) *Handler {
 	h := &Handler{store: s, changelog: cl, sse: broker, tokens: ts}
 	h.mux = http.NewServeMux()
-	h.mux.HandleFunc("GET /changes", h.withAuth(h.handleChanges))
-	h.mux.HandleFunc("GET /file/{path...}", h.withAuth(h.handleGetFile))
-	h.mux.HandleFunc("PUT /file/{path...}", h.withAuth(h.handlePutFile))
-	h.mux.HandleFunc("DELETE /file/{path...}", h.withAuth(h.handleDeleteFile))
-	h.mux.HandleFunc("GET /events", h.withAuth(h.handleEvents))
+	h.mux.HandleFunc("GET /changes", h.withAuth(h.counted("GET /changes", h.handleChanges)))
+	h.mux.HandleFunc("GET /file/{path...}", h.withAuth(h.counted("GET /file", h.handleGetFile)))
+	h.mux.HandleFunc("PUT /file/{path...}", h.withAuth(h.logged(audit.FilePut, h.handlePutFile)))
+	h.mux.HandleFunc("DELETE /file/{path...}", h.withAuth(h.logged(audit.FileDelete, h.handleDeleteFile)))
+	h.mux.HandleFunc("GET /events", h.withAuth(h.streamLogged(h.handleEvents)))
 	h.mux.HandleFunc("POST /pair", h.withAuth(h.handlePair))
-	h.mux.HandleFunc("GET /devices", h.withAuth(h.handleListDevices))
+	h.mux.HandleFunc("GET /devices", h.withAuth(h.counted("GET /devices", h.handleListDevices)))
 	h.mux.HandleFunc("DELETE /devices/{id}", h.withAuth(h.handleRevokeDevice))
+
+	h.mux.HandleFunc("GET /admin", h.handleAdminPage)
+	h.mux.HandleFunc("GET /admin/api/devices", h.withAdmin(h.handleAdminDevices))
+	h.mux.HandleFunc("DELETE /admin/api/devices/{id}", h.withAdmin(h.handleAdminRevoke))
+	h.mux.HandleFunc("GET /admin/api/events", h.withAdmin(h.handleAdminEvents))
+	h.mux.HandleFunc("GET /admin/api/stats", h.withAdmin(h.handleAdminStats))
 	return h
 }
 
@@ -78,33 +92,126 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
-// withAuth wraps a handler with per-device bearer token authentication.
+// WithAudit enables the activity journal. When trustProxy is true the client
+// IP is taken from X-Forwarded-For instead of the TCP peer address — only
+// set it behind a proxy that overwrites that header.
+func (h *Handler) WithAudit(l *audit.Log, trustProxy bool) *Handler {
+	h.audit = l
+	h.trustProxy = trustProxy
+	return h
+}
+
+type ctxKey struct{}
+
+// deviceID returns the authenticated device id stored by withAuth, or "".
+func deviceID(r *http.Request) string {
+	id, _ := r.Context().Value(ctxKey{}).(string)
+	return id
+}
+
+// withAuth wraps a handler with per-device bearer token authentication and
+// stores the authenticated device id in the request context.
 // EventSource clients (GET /events) may pass the token as ?token= query param
 // since the browser EventSource API cannot set custom headers.
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		authed := func(id string) {
+			next(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, id)))
+		}
 		// SSE clients (EventSource) cannot set headers; accept ?token= on /events.
 		// If it's missing/invalid, fall through to the normal header check below
 		// rather than failing immediately — /events also accepts a normal
 		// Authorization header from non-EventSource callers.
 		if r.URL.Path == "/events" {
-			if _, ok := h.tokens.Verify(r.URL.Query().Get("token")); ok {
-				next(w, r)
+			if id, ok := h.tokens.Verify(r.URL.Query().Get("token")); ok {
+				authed(id)
 				return
 			}
 		}
 		const prefix = "Bearer "
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, prefix) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			h.authFailed(w, r)
 			return
 		}
-		if _, ok := h.tokens.Verify(strings.TrimPrefix(auth, prefix)); !ok {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		id, ok := h.tokens.Verify(strings.TrimPrefix(auth, prefix))
+		if !ok {
+			h.authFailed(w, r)
 			return
+		}
+		authed(id)
+	}
+}
+
+func (h *Handler) authFailed(w http.ResponseWriter, r *http.Request) {
+	h.record(audit.Entry{Event: audit.AuthFailed, Path: r.URL.Path, Status: http.StatusUnauthorized, IP: h.clientIP(r)})
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+// record writes e to the journal. A journal failure is logged and never
+// affects the response: sync must keep working if the audit file can't be written.
+func (h *Handler) record(e audit.Entry) {
+	if h.audit == nil {
+		return
+	}
+	if err := h.audit.Record(e); err != nil {
+		log.Printf("audit: %v", err)
+	}
+}
+
+// logged records a journal entry for event after next has run.
+func (h *Handler) logged(event string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		next(w, r)
+		e := audit.Entry{DeviceID: deviceID(r), Event: event, Path: r.PathValue("path"), Status: statusOf(w), IP: h.clientIP(r)}
+		if w.Header().Get("X-Conflict") == "true" {
+			e.Detail = "conflict"
+		}
+		h.record(e)
+	}
+}
+
+// counted tallies a high-frequency request (polling) instead of journaling it.
+func (h *Handler) counted(kind string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.audit != nil {
+			h.audit.Count(deviceID(r), kind)
 		}
 		next(w, r)
 	}
+}
+
+// streamLogged records when an SSE stream opens and when it closes.
+func (h *Handler) streamLogged(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		e := audit.Entry{DeviceID: deviceID(r), Event: audit.SSEConnect, Path: r.URL.Path, IP: h.clientIP(r)}
+		h.record(e)
+		next(w, r)
+		e.Event = audit.SSEDisconnect
+		h.record(e)
+	}
+}
+
+func statusOf(w http.ResponseWriter) int {
+	if sr, ok := w.(*statusRecorder); ok {
+		return sr.status
+	}
+	return http.StatusOK
+}
+
+// clientIP returns the caller's IP: the TCP peer, or the first
+// X-Forwarded-For entry when the handler is configured to trust the proxy.
+func (h *Handler) clientIP(r *http.Request) string {
+	if h.trustProxy {
+		if first := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); first != "" {
+			return first
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // handleChanges returns changelog entries newer than the given ?since= Unix timestamp.
@@ -288,6 +395,8 @@ func (h *Handler) handlePair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "issue failed", http.StatusInternalServerError)
 		return
 	}
+	h.record(audit.Entry{DeviceID: id, Event: audit.TokenIssued, Status: http.StatusOK, IP: h.clientIP(r),
+		Detail: "actor=" + deviceID(r) + " label=" + label})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"id": id, "token": token})
 }
@@ -311,11 +420,11 @@ func (h *Handler) handleRevokeDevice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	h.record(audit.Entry{DeviceID: id, Event: audit.TokenRevoked, Status: http.StatusOK, IP: h.clientIP(r),
+		Detail: "actor=" + deviceID(r)})
 	w.WriteHeader(http.StatusOK)
 }
 
 // nowUnix returns the current time as a Unix timestamp.
 // Declared here for use by T6/T7 file-mutation handlers.
 func nowUnix() int64 { return time.Now().Unix() }
-
-

@@ -23,6 +23,15 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret }}
                   key: {{ .Values.auth.existingSecretKey }}
+            {{- if .Values.admin.existingSecret }}
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.admin.existingSecret }}
+                  key: {{ .Values.admin.existingSecretKey }}
+            {{- end }}
+            - name: TRUST_PROXY_HEADERS
+              value: {{ .Values.trustProxyHeaders | quote }}
             - name: DATA_DIR
               value: /data
           volumeMounts:

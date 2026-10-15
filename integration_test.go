@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/audit"
 	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/changelog"
 	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/handler"
 	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/sse"
@@ -261,4 +262,66 @@ func TestIntegration_PairAndRevoke(t *testing.T) {
 	oldResp, err := http.DefaultClient.Do(oldReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusUnauthorized, oldResp.StatusCode)
+}
+
+const integrationAdminToken = "integration-admin"
+
+// startAdminServer is startServer with the activity journal and admin UI on.
+func startAdminServer(t *testing.T) string {
+	dir := t.TempDir()
+	ts, err := tokens.New(filepath.Join(dir, "tokens.json"))
+	require.NoError(t, err)
+	_, _, err = ts.Bootstrap(integrationToken)
+	require.NoError(t, err)
+
+	h := handler.New(store.New(filepath.Join(dir, "vault")), changelog.New(filepath.Join(dir, "changelog.jsonl")), sse.NewBroker(), ts).
+		WithAudit(audit.New(filepath.Join(dir, "audit.jsonl")), false).
+		WithAdmin(integrationAdminToken)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := &http.Server{Handler: h}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+	return fmt.Sprintf("http://%s", ln.Addr())
+}
+
+func adminGet(t *testing.T, url string) []map[string]any {
+	req, err := http.NewRequest("GET", url, nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+integrationAdminToken)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var out []map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	return out
+}
+
+func TestIntegration_AdminSeesTokenActivityAndRevokes(t *testing.T) {
+	base := startAdminServer(t)
+
+	resp := authedReq(t, "PUT", base+"/file/notes/a.md", []byte("hi"), map[string]string{"X-Base-Hash": ""})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	devices := adminGet(t, base+"/admin/api/devices")
+	require.Len(t, devices, 1)
+	id := devices[0]["id"].(string)
+
+	events := adminGet(t, base+"/admin/api/events?event=file_put&device="+id)
+	require.Len(t, events, 1)
+	require.Equal(t, "notes/a.md", events[0]["path"])
+
+	delReq, _ := http.NewRequest("DELETE", base+"/admin/api/devices/"+id, nil)
+	delReq.Header.Set("Authorization", "Bearer "+integrationAdminToken)
+	delResp, err := http.DefaultClient.Do(delReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, delResp.StatusCode)
+
+	// The revoked device is locked out, and its failed attempt is journaled.
+	resp = authedReq(t, "GET", base+"/changes?since=0", nil, nil)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	require.Len(t, adminGet(t, base+"/admin/api/events?event=auth_failed"), 1)
+	require.Len(t, adminGet(t, base+"/admin/api/events?event=token_revoked"), 1)
 }

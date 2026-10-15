@@ -89,6 +89,9 @@ docker compose pull && docker compose up -d
 | `PORT`            | `8080`  | HTTP listen port                                                       |
 | `DATA_DIR`        | `/data` | Where blobs, the changelog, and `tokens.json` are stored               |
 | `BOOTSTRAP_TOKEN` | (unset) | Seed a specific first-device token instead of generating one randomly  |
+| `ADMIN_TOKEN`     | (unset) | Enables the `/admin` web UI (see below). Unset = `/admin*` return 404  |
+| `AUDIT_RETENTION_DAYS` | `30` | How long the activity journal (`audit.jsonl`) is kept              |
+| `TRUST_PROXY_HEADERS` | `false` | Take the client IP in the journal from `X-Forwarded-For`. Only set to `true` behind a proxy that overwrites that header |
 
 ## API
 
@@ -101,6 +104,27 @@ docker compose pull && docker compose up -d
 
 All endpoints except the unauthenticated preflight (`OPTIONS`) require
 `Authorization: Bearer <device-token>`.
+
+## Admin web UI
+
+Set `ADMIN_TOKEN` to a long random value (separate from any device token) and
+open `/admin`. After entering the token you see every issued device token
+(label, created, last seen, a 24 h polling sparkline) and the activity log:
+file uploads/deletes, SSE connects/disconnects, tokens issued/revoked, and
+failed authentications (with IP). A **Revoke** button cuts a token off
+immediately — handy if a phone is lost and you only have a browser.
+
+- `ADMIN_TOKEN` opens only `/admin/api/*`; it cannot sync files, and device
+  tokens cannot open the admin API.
+- Failed admin logins are journaled and rate-limited (10 per minute per IP, then `429`).
+- High-frequency requests (`GET /changes`, `GET /file/...`) are not logged line by
+  line, only counted per device and hour.
+- The journal lives in `DATA_DIR/audit.jsonl` and is pruned after `AUDIT_RETENTION_DAYS`.
+
+Admin API (Bearer `ADMIN_TOKEN`): `GET /admin/api/devices`,
+`DELETE /admin/api/devices/{id}`,
+`GET /admin/api/events?device=&event=&exclude=&since=<RFC3339>&limit=`,
+`GET /admin/api/stats`.
 
 ## Other deployment options
 

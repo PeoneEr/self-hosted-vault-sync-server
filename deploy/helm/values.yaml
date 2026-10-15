@@ -11,6 +11,20 @@ auth:
   existingSecret: vault-sync-auth
   existingSecretKey: authToken
 
+# Optional admin web UI at /admin (list of tokens + activity log, token
+# revocation). Disabled unless admin.existingSecret is set. Create a secret
+# with a long random value, separate from the device tokens:
+#
+#   kubectl create secret generic vault-sync-admin \
+#     --from-literal=adminToken=$(openssl rand -hex 24)
+admin:
+  existingSecret: ""
+  existingSecretKey: adminToken
+
+# Take the client IP in the activity log from X-Forwarded-For. Only enable
+# if your ingress overwrites (not passes through) that header.
+trustProxyHeaders: "false"
+
 ingress:
   enabled: false
   className: nginx

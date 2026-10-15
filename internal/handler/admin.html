@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Vault Sync — admin</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --panel: #fff; --text: #1c2025; --muted: #667085; --line: #e3e6eb;
+    --accent: #3b6fd4; --danger: #c8372d; --ok: #1f8a4c; --warn: #b7791f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14161a; --panel: #1c1f25; --text: #e6e8ec; --muted: #98a1ae; --line: #2c3038;
+            --accent: #6d9bf0; --danger: #ef6a60; --ok: #4cc27f; --warn: #e0a84a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between;
+           padding: 14px 24px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  h2 { font-size: 13px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  td.path { white-space: normal; word-break: break-all; min-width: 160px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  button, select, input { font: inherit; color: inherit; background: var(--panel);
+         border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.danger { color: var(--danger); }
+  button.danger:hover { border-color: var(--danger); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .toolbar .grow { flex: 1; }
+  .muted { color: var(--muted); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+  .pill.bad { color: var(--danger); border-color: var(--danger); }
+  .pill.good { color: var(--ok); border-color: var(--ok); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .spark { display: inline-flex; align-items: flex-end; gap: 1px; height: 22px; }
+  .spark span { width: 4px; background: var(--accent); opacity: .85; min-height: 1px; border-radius: 1px; }
+  .spark span.zero { background: var(--line); }
+  #login { max-width: 360px; margin: 12vh auto; display: grid; gap: 12px; }
+  #login input { width: 100%; }
+  #msg { min-height: 20px; color: var(--danger); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="login" hidden>
+  <h1>Vault Sync — admin</h1>
+  <input id="token" type="password" placeholder="Admin token" autocomplete="off">
+  <button id="signin" class="primary">Sign in</button>
+  <div id="msg" role="alert"></div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>Vault Sync — admin</h1>
+    <div class="toolbar" style="margin:0">
+      <span id="updated" class="muted"></span>
+      <button id="refresh">Refresh</button>
+      <button id="logout">Sign out</button>
+    </div>
+  </header>
+  <main>
+    <section>
+      <h2>Tokens</h2>
+      <table>
+        <thead><tr><th>Label</th><th>ID</th><th>Created</th><th>Last seen</th><th>Polling, 24 h</th><th></th></tr></thead>
+        <tbody id="devices"></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Activity</h2>
+      <div class="toolbar">
+        <select id="f-device"><option value="">All tokens</option></select>
+        <select id="f-event"><option value="">All events</option></select>
+        <span class="muted grow" id="count"></span>
+      </div>
+      <table>
+        <thead><tr><th>Time</th><th>Token</th><th>Event</th><th>Path</th><th>Status</th><th>IP</th><th>Detail</th></tr></thead>
+        <tbody id="events"></tbody>
+      </table>
+    </section>
+  </main>
+</div>
+
+<script>
+"use strict";
+// Every value that came from the server (labels, paths, details) is put on
+// the page with textContent — never innerHTML — because device labels are
+// chosen by clients.
+const KEY = "vaultSyncAdminToken";
+const EVENTS = ["file_put", "file_delete", "sse_connect", "sse_disconnect",
+                "token_issued", "token_revoked", "auth_failed", "admin_login_failed"];
+const $ = (id) => document.getElementById(id);
+let timer = null;
+
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined && text !== null) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+function cell(content, cls) {
+  const td = el("td", typeof content === "string" ? content : "", cls);
+  if (typeof content === "object" && content) td.appendChild(content);
+  return td;
+}
+const fmt = (iso) => iso ? new Date(iso).toLocaleString() : "";
+
+async function api(method, path) {
+  const res = await fetch("/admin/api/" + path, {
+    method, headers: { Authorization: "Bearer " + sessionStorage.getItem(KEY) }, cache: "no-store",
+  });
+  if (res.status === 401) throw Object.assign(new Error("Wrong admin token"), { auth: true });
+  if (res.status === 429) throw Object.assign(new Error("Too many attempts — wait a minute"), { auth: true });
+  if (res.status === 404) throw Object.assign(new Error("Admin is not enabled on this server"), { auth: true });
+  if (!res.ok) throw new Error(method + " " + path + ": " + res.status);
+  return res.headers.get("content-type")?.includes("json") ? res.json() : null;
+}
+
+function showLogin(message) {
+  clearInterval(timer);
+  $("app").hidden = true;
+  $("login").hidden = false;
+  $("msg").textContent = message || "";
+  $("token").focus();
+}
+
+function spark(rows) {
+  // rows: hourly buckets for one device, last 24 h.
+  const now = new Date(); now.setMinutes(0, 0, 0);
+  const buckets = new Array(24).fill(0);
+  for (const r of rows) {
+    const ago = Math.round((now - new Date(r.hour)) / 3600000);
+    if (ago >= 0 && ago < 24) buckets[23 - ago] += r.count;
+  }
+  const max = Math.max(1, ...buckets);
+  const box = el("span", null, "spark");
+  for (const n of buckets) {
+    const s = el("span", null, n ? "" : "zero");
+    s.style.height = Math.max(8, Math.round(100 * n / max)) + "%";
+    s.title = n + " requests";
+    box.appendChild(s);
+  }
+  const total = buckets.reduce((a, b) => a + b, 0);
+  const wrap = el("span");
+  wrap.append(box, " ", el("span", total + "", "muted mono"));
+  return wrap;
+}
+
+function renderDevices(devices, stats) {
+  const tbody = $("devices");
+  tbody.replaceChildren();
+  const byDevice = {};
+  for (const r of stats) (byDevice[r.deviceId] ||= []).push(r);
+  for (const d of devices) {
+    const tr = el("tr");
+    const revoke = el("button", "Revoke", "danger");
+    revoke.addEventListener("click", async () => {
+      if (!confirm("Revoke token \"" + d.label + "\" (" + d.id + ")?\nThat device will stop syncing immediately.")) return;
+      try { await api("DELETE", "devices/" + encodeURIComponent(d.id)); await load(); }
+      catch (e) { alert(e.message); }
+    });
+    tr.append(cell(d.label), cell(el("code", d.id)), cell(fmt(d.createdAt)), cell(fmt(d.lastSeenAt)),
+              cell(spark(byDevice[d.id] || [])), cell(revoke));
+    tbody.appendChild(tr);
+  }
+  if (!devices.length) tbody.appendChild(el("tr")).appendChild(el("td", "No tokens", "muted"));
+
+  // Keep the device filter in sync, preserving the current choice.
+  const sel = $("f-device"), cur = sel.value;
+  sel.replaceChildren(new Option("All tokens", ""));
+  for (const d of devices) sel.appendChild(new Option(d.label + " (" + d.id + ")", d.id));
+  sel.value = devices.some((d) => d.id === cur) ? cur : "";
+}
+
+function statusPill(code) {
+  if (!code) return "";
+  return el("span", code + "", "pill " + (code >= 400 ? "bad" : "good"));
+}
+
+function renderEvents(entries, labels) {
+  const tbody = $("events");
+  tbody.replaceChildren();
+  for (const e of entries) {
+    const bad = e.event === "auth_failed" || e.event === "admin_login_failed";
+    const who = e.deviceId ? (labels[e.deviceId] ? labels[e.deviceId] + " " : "") + e.deviceId : "—";
+    const tr = el("tr");
+    tr.append(cell(fmt(e.ts)), cell(who, "mono"), cell(el("span", e.event, "pill" + (bad ? " bad" : e.event === "token_revoked" ? " warn" : ""))),
+              cell(e.path || "", "path mono"), cell(statusPill(e.status)), cell(e.ip || "", "mono"), cell(e.detail || "", "mono"));
+    tbody.appendChild(tr);
+  }
+  if (!entries.length) tbody.appendChild(el("tr")).appendChild(el("td", "No events", "muted"));
+  $("count").textContent = entries.length + " shown, newest first";
+}
+
+async function load() {
+  try {
+    const p = new URLSearchParams({ limit: "200", exclude: "poll_summary" });
+    if ($("f-device").value) p.set("device", $("f-device").value);
+    if ($("f-event").value) { p.set("event", $("f-event").value); p.delete("exclude"); }
+    const [devices, stats, events] = await Promise.all([
+      api("GET", "devices"), api("GET", "stats"), api("GET", "events?" + p),
+    ]);
+    $("login").hidden = true;
+    $("app").hidden = false;
+    renderDevices(devices, stats);
+    const labels = Object.fromEntries(devices.map((d) => [d.id, d.label]));
+    renderEvents(events, labels);
+    $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    if (e.auth) { sessionStorage.removeItem(KEY); showLogin(e.message); }
+    else $("updated").textContent = e.message;
+  }
+}
+
+function start() {
+  clearInterval(timer);
+  load();
+  timer = setInterval(() => { if (!document.hidden) load(); }, 30000);
+}
+
+$("signin").addEventListener("click", () => {
+  const t = $("token").value.trim();
+  if (!t) return;
+  sessionStorage.setItem(KEY, t);
+  $("token").value = "";
+  start();
+});
+$("token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("signin").click(); });
+$("refresh").addEventListener("click", load);
+$("logout").addEventListener("click", () => { sessionStorage.removeItem(KEY); showLogin(); });
+$("f-device").addEventListener("change", load);
+$("f-event").addEventListener("change", load);
+for (const ev of EVENTS) $("f-event").appendChild(new Option(ev, ev));
+
+if (sessionStorage.getItem(KEY)) start(); else showLogin();
+</script>
+</body>
+</html>
